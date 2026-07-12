@@ -1,0 +1,952 @@
+"""
+Fused HUD  —  Camera + YOLOv8n  ×  BGT60TR13C Radar
+====================================================
+One window, three panels:
+  [ CAMERA + YOLO feed ]  [ Radar polar scope ]  [ Sidebar: targets / range profile / system ]
+
+Low-light logic:
+  - Radar targets are projected onto the camera panel by angle. If a YOLO
+    box overlaps that column -> drawn in the "confirmed" accent color.
+    If not -> drawn in magenta as "RADAR-ONLY", meaning the radar sees
+    something the camera/YOLO currently can't (e.g. low light).
+
+This keeps your original radar HUD's visual language (topbar / sidebar /
+target cards / range profile / polar scope) and adds a camera panel that
+runs YOLO in its own thread, feeding the same window.
+
+Dependencies:
+    pip install pygame numpy opencv-python ultralytics gpiozero lgpio
+Run from the same folder as your existing utility/ and radar_config/.
+"""
+
+from gpiozero import Device
+from gpiozero.pins.lgpio import LGPIOFactory
+Device.pin_factory = LGPIOFactory()
+
+import pygame
+import pygame.gfxdraw
+import numpy as np
+import cv2
+import time
+import json
+import math
+import subprocess
+import threading
+
+from ultralytics import YOLO
+
+from utility.BGT60TR13C import BGT60TR13C
+from utility.helper import (
+    find_register_config_in_directory,
+    find_setting_in_directory,
+    calculate_frame_size,
+)
+
+# ─────────────────────────────────────────────
+#  CONFIG — camera / YOLO
+# ─────────────────────────────────────────────
+CAM_W, CAM_H = 640, 480
+FRAME_SIZE = int(CAM_W * CAM_H * 1.5)
+FOCAL_LENGTH = 700  # recalibrate for your lens
+KNOWN_WIDTHS = {"person": 0.5, "car": 1.8, "bottle": 0.07}
+CAMERA_HFOV_DEG = 62.2  # recalibrate for your lens
+MAX_YOLO_DETECTIONS = 2  # only keep the 2 highest-confidence detections per frame
+
+# ─────────────────────────────────────────────
+#  CONFIG — radar
+# ─────────────────────────────────────────────
+CONFIG_DIR = "./radar_config/config_3rx_5m"
+MAX_RANGE_M = 5.0
+PRIORITY_RANGE_M = 3.0
+MAX_TARGETS = 2
+RADAR_FOV_DEG = 60.0
+
+# ─────────────────────────────────────────────
+#  CONFIG — window layout
+# ─────────────────────────────────────────────
+CAMERA_PANEL_W = 480
+RADAR_AREA_W   = 480
+SIDEBAR_W      = 340
+WIN_W = CAMERA_PANEL_W + RADAR_AREA_W + SIDEBAR_W
+WIN_H = 720
+FPS   = 30
+
+TOPBAR_H    = 56
+BOTTOMBAR_H = 64
+
+# Polar scope center sits inside its own column, offset past the camera panel
+RCX = CAMERA_PANEL_W + RADAR_AREA_W // 2
+RCY = TOPBAR_H + (WIN_H - TOPBAR_H - BOTTOMBAR_H) // 2
+RAD = min(RADAR_AREA_W, WIN_H - TOPBAR_H - BOTTOMBAR_H) // 2 - 36
+
+CAM_X = 0
+CAM_Y = TOPBAR_H
+CAM_PANEL_H = WIN_H - TOPBAR_H - BOTTOMBAR_H
+
+# ─────────────────────────────────────────────
+#  COLOUR PALETTE
+# ─────────────────────────────────────────────
+BG          = ( 10,  13,  18)
+PANEL_BG    = ( 15,  19,  26)
+PANEL_BG2   = ( 19,  24,  33)
+BORDER      = ( 32,  40,  53)
+BORDER_SOFT = ( 24,  30,  40)
+
+TEXT_PRI    = (230, 236, 242)
+TEXT_SEC    = (134, 148, 166)
+TEXT_TERT   = ( 82,  94, 110)
+
+ACCENT      = ( 56, 189, 248)
+ACCENT_DIM  = ( 30,  78, 104)
+ACCENT_GLOW = (125, 211, 252)
+
+SUCCESS     = ( 52, 211, 153)
+WARNING     = (251, 191,  36)
+DANGER      = (248, 113, 113)
+RADAR_ONLY_COL = (232,  90, 220)  # magenta: radar sees it, camera doesn't
+
+GRID_LINE   = ( 28,  36,  48)
+GRID_LINE_2 = ( 22,  29,  39)
+RING_MAIN   = ( 45,  58,  76)
+
+SIG_LOW, SIG_MID, SIG_HIGH = DANGER, WARNING, SUCCESS
+
+# ─────────────────────────────────────────────
+#  SHARED STATE
+# ─────────────────────────────────────────────
+lock = threading.Lock()
+latest_frame = None       # raw camera frame (numpy BGR)
+yolo_detections = []       # [{label, x1, y1, x2, y2, cam_dist, conf}]
+yolo_fps = 0.0             # actual YOLO inference rate (separate from render FPS)
+radar_fps = 0.0            # actual radar frame processing rate
+running = True
+
+model = YOLO("yolov8n.pt")
+
+# ─────────────────────────────────────────────
+#  CAMERA CAPTURE THREAD
+# ─────────────────────────────────────────────
+cam_cmd = [
+    "rpicam-vid", "--codec", "yuv420", "--nopreview",
+    "--width", str(CAM_W), "--height", str(CAM_H),
+    "--framerate", "30", "-t", "0", "-o", "-",
+]
+cam_proc = subprocess.Popen(cam_cmd, stdout=subprocess.PIPE, bufsize=10 ** 8)
+
+
+def capture_thread():
+    global latest_frame
+    while running:
+        raw = cam_proc.stdout.read(FRAME_SIZE)
+        if len(raw) != FRAME_SIZE:
+            if not running:
+                break
+            continue
+        yuv = np.frombuffer(raw, dtype=np.uint8).reshape((int(CAM_H * 1.5), CAM_W))
+        frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+        with lock:
+            latest_frame = frame
+
+
+# ─────────────────────────────────────────────
+#  YOLO INFERENCE THREAD
+# ─────────────────────────────────────────────
+def inference_thread():
+    global yolo_detections, yolo_fps
+    last_t = time.time()
+    while running:
+        with lock:
+            frame = latest_frame.copy() if latest_frame is not None else None
+        if frame is None:
+            time.sleep(0.01)
+            continue
+
+        results = model(frame, imgsz=256, conf=0.4, verbose=False)
+        dets = []
+        for r in results:
+            names = r.names
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                label = names[cls_id]
+                conf = float(box.conf[0])
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                pixel_width = x2 - x1
+                cam_dist = None
+                if label in KNOWN_WIDTHS and pixel_width > 0:
+                    cam_dist = (KNOWN_WIDTHS[label] * FOCAL_LENGTH) / pixel_width
+                dets.append({
+                    "label": label, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "cam_dist": cam_dist, "conf": conf,
+                })
+
+        # Keep only the top MAX_YOLO_DETECTIONS by confidence
+        dets.sort(key=lambda d: d["conf"], reverse=True)
+        dets = dets[:MAX_YOLO_DETECTIONS]
+
+        now_t = time.time()
+        dt = now_t - last_t
+        if dt > 0:
+            yolo_fps = 1.0 / dt
+        last_t = now_t
+
+        with lock:
+            yolo_detections = dets
+        time.sleep(0.001)
+
+
+def angle_to_cam_pixel_x(angle_deg):
+    half_fov = CAMERA_HFOV_DEG / 2
+    frac = (angle_deg + half_fov) / CAMERA_HFOV_DEG
+    frac = min(max(frac, 0.0), 1.0)
+    return int(frac * CAM_W)
+
+
+# ─────────────────────────────────────────────
+#  RADAR DSP
+# ─────────────────────────────────────────────
+def process_radar_cube(raw_data, setting_data):
+    num_rx      = int(setting_data.get("num_rx_antennas",      3))
+    num_chirps  = int(setting_data.get("num_chirps_per_frame", 16))
+    num_samples = int(setting_data.get("num_samples_per_chirp", 64))
+    expected    = num_rx * num_chirps * num_samples
+    data        = raw_data[:expected].astype(np.float32) - 2048.0
+    if data.size < expected:
+        raise ValueError("Frame too small")
+    cube      = data.reshape(num_rx, num_chirps, num_samples)
+    range_fft = np.fft.rfft(cube, axis=2)
+    magnitude = np.abs(range_fft).mean(axis=0)
+    return magnitude
+
+# ─────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────
+def lerp(a, b, t):
+    return a + (b - a) * max(0.0, min(1.0, t))
+
+def lerp_color(c1, c2, t):
+    t = max(0.0, min(1.0, t))
+    return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+def signal_color(energy):
+    if energy < 0.5:
+        return lerp_color(SIG_LOW, SIG_MID, energy / 0.5)
+    return lerp_color(SIG_MID, SIG_HIGH, (energy - 0.5) / 0.5)
+
+def fill_aa_circle(surf, color, cx, cy, r):
+    if r <= 0:
+        return
+    pygame.gfxdraw.filled_circle(surf, cx, cy, r, color)
+    pygame.gfxdraw.aacircle(surf, cx, cy, r, color)
+
+def draw_dashed_circle(surf, color, cx, cy, r, dash=5, gap=6):
+    if r <= 0:
+        return
+    circ  = 2 * math.pi * r
+    total = dash + gap
+    steps = max(1, int(circ / total))
+    for i in range(steps):
+        a0  = 2 * math.pi * i * total / circ
+        a1  = 2 * math.pi * (i * total + dash) / circ
+        pts = [(int(cx + r * math.cos(t)), int(cy + r * math.sin(t)))
+               for t in np.linspace(a0, a1, 6)]
+        if len(pts) >= 2:
+            pygame.draw.lines(surf, color, False, pts, 1)
+
+def range_zone(dist_m):
+    if dist_m < 1.5:
+        return "NEAR"
+    if dist_m < 3.0:
+        return "MID"
+    return "FAR"
+
+def zone_color(zone):
+    return {"NEAR": DANGER, "MID": WARNING, "FAR": SUCCESS}[zone]
+
+def rounded_rect(surf, rect, color, radius=8, width=0):
+    pygame.draw.rect(surf, color, rect, width, border_radius=radius)
+
+# ─────────────────────────────────────────────
+#  TARGET TRACKER
+# ─────────────────────────────────────────────
+class Target:
+    _next_id = 1
+
+    def __init__(self, px, py, dist_m, angle_deg, energy):
+        self.id        = Target._next_id
+        Target._next_id += 1
+        self.px        = px
+        self.py        = py
+        self.dist_m    = dist_m
+        self.angle_deg = angle_deg
+        self.energy    = energy
+        self.last_seen = time.time()
+        self.trail     = [(px, py)]
+        self.lock_anim = 0.25
+
+    def update(self, px, py, dist_m, angle_deg, energy):
+        self.trail.append((px, py))
+        if len(self.trail) > 24:
+            self.trail.pop(0)
+        self.px, self.py        = px, py
+        self.dist_m, self.angle_deg = dist_m, angle_deg
+        self.energy              = energy
+        self.last_seen           = time.time()
+        self.lock_anim           = min(1.0, self.lock_anim + 0.06)
+
+    def stale(self):
+        return time.time() - self.last_seen > 2.5
+
+# ─────────────────────────────────────────────
+#  PYGAME INIT
+# ─────────────────────────────────────────────
+pygame.init()
+screen = pygame.display.set_mode((WIN_W, WIN_H))
+pygame.display.set_caption("Fused Camera+YOLO / BGT60TR13C Radar HUD")
+clock  = pygame.time.Clock()
+
+def try_font(names, size, bold=False):
+    for n in names:
+        try:
+            f = pygame.font.SysFont(n, size, bold=bold)
+            if f:
+                return f
+        except Exception:
+            continue
+    return pygame.font.SysFont(None, size, bold=bold)
+
+SANS = ["Inter", "Segoe UI", "Helvetica Neue", "Arial", "DejaVu Sans"]
+MONO = ["JetBrains Mono", "Consolas", "DejaVu Sans Mono", "Courier New"]
+
+font_brand    = try_font(SANS, 17, bold=True)
+font_pill     = try_font(SANS, 12)
+font_h        = try_font(SANS, 12, bold=True)
+font_body     = try_font(SANS, 13)
+font_body_b   = try_font(SANS, 13, bold=True)
+font_small    = try_font(SANS, 11)
+font_tiny     = try_font(SANS, 10)
+font_metric   = try_font(MONO, 20, bold=True)
+font_metric_s = try_font(MONO, 15, bold=True)
+font_mono_sm  = try_font(MONO, 11)
+font_mono_tag = try_font(MONO, 12, bold=True)
+font_bottom_v = try_font(SANS, 22, bold=True)
+
+# ─────────────────────────────────────────────
+#  STATIC RADAR SURFACE (unchanged from your HUD, just re-centered)
+# ─────────────────────────────────────────────
+def build_static_radar():
+    surf = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+
+    for rr in range(RAD, 0, -1):
+        if rr % 14 != 0:
+            continue
+        t = rr / RAD
+        shade = int(lerp(16, 10, 1 - t))
+        pygame.gfxdraw.filled_circle(surf, RCX, RCY, rr, (shade, shade + 3, shade + 7, 255))
+
+    for ring in range(1, 6):
+        r  = int(RAD * ring / 5)
+        rm = MAX_RANGE_M * ring / 5
+        is_outer = ring == 5
+        col   = RING_MAIN if is_outer else GRID_LINE
+        alpha = 235 if is_outer else 120
+        pygame.gfxdraw.aacircle(surf, RCX, RCY, r, (*col, alpha))
+        lbl = font_tiny.render(f"{rm:.0f} m", True, (*TEXT_TERT, 255))
+        surf.blit(lbl, (RCX + r - lbl.get_width() - 6, RCY - lbl.get_height() - 3))
+
+    for frac in (0.2, 0.4, 0.6, 0.8):
+        draw_dashed_circle(surf, (*GRID_LINE_2, 160), RCX, RCY, int(RAD * frac))
+
+    for deg in range(0, 360, 30):
+        a      = math.radians(deg - 90)
+        is_maj = deg % 90 == 0
+        col    = GRID_LINE if is_maj else GRID_LINE_2
+        alpha  = 140 if is_maj else 70
+        ex = int(RCX + RAD * math.cos(a))
+        ey = int(RCY + RAD * math.sin(a))
+        pygame.draw.line(surf, (*col, alpha), (RCX, RCY), (ex, ey), 1)
+
+    for deg, lbl_str in [(0, "N"), (90, "E"), (180, "S"), (270, "W")]:
+        a  = math.radians(deg - 90)
+        lx = int(RCX + (RAD + 22) * math.cos(a))
+        ly = int(RCY + (RAD + 22) * math.sin(a))
+        t  = font_small.render(lbl_str, True, (*TEXT_SEC, 255))
+        surf.blit(t, (lx - t.get_width() // 2, ly - t.get_height() // 2))
+
+    fov_pts = [
+        (int(RCX + (RAD + 13) * math.cos(math.radians(d - 90))),
+         int(RCY + (RAD + 13) * math.sin(math.radians(d - 90))))
+        for d in range(-60, 61, 2)
+    ]
+    pygame.draw.lines(surf, (*ACCENT_DIM, 150), False, fov_pts, 1)
+
+    for deg in range(-60, 61, 15):
+        a = math.radians(deg - 90)
+        is_maj = deg % 30 == 0
+        r0 = RAD + 11
+        r1 = RAD + (22 if is_maj else 15)
+        pygame.draw.line(
+            surf, (*ACCENT, 170 if is_maj else 70),
+            (int(RCX + r0 * math.cos(a)), int(RCY + r0 * math.sin(a))),
+            (int(RCX + r1 * math.cos(a)), int(RCY + r1 * math.sin(a))), 1
+        )
+        if is_maj:
+            lbl_str = f"{deg:+d}°" if deg != 0 else "0°"
+            lbl_img = font_tiny.render(lbl_str, True, (*TEXT_TERT, 255))
+            lx = int(RCX + (RAD + 36) * math.cos(a)) - lbl_img.get_width() // 2
+            ly = int(RCY + (RAD + 36) * math.sin(a)) - lbl_img.get_height() // 2
+            surf.blit(lbl_img, (lx, ly))
+
+    pr_r = int(RAD * (PRIORITY_RANGE_M / MAX_RANGE_M))
+    pygame.gfxdraw.aacircle(surf, RCX, RCY, pr_r, (*ACCENT, 90))
+    draw_dashed_circle(surf, (*ACCENT, 60), RCX, RCY, pr_r, dash=4, gap=6)
+
+    pygame.gfxdraw.aacircle(surf, RCX, RCY, RAD,     (*RING_MAIN, 235))
+    pygame.gfxdraw.aacircle(surf, RCX, RCY, RAD + 1, (*RING_MAIN,  60))
+
+    return surf
+
+print("Starting Fused HUD …")
+static_radar = build_static_radar()
+
+# ─────────────────────────────────────────────
+#  RADAR HARDWARE INIT
+# ─────────────────────────────────────────────
+radar       = None
+targets     = {}
+frame_no    = 0
+objects_raw = []
+
+try:
+    radar = BGT60TR13C(spi_speed=50_000_000)
+    radar.check_chip_id()
+
+    reg_file = find_register_config_in_directory(CONFIG_DIR)
+    radar.set_register_config_file(reg_file)
+
+    setting_file = find_setting_in_directory(CONFIG_DIR)
+    with open(setting_file, "r") as f:
+        setting_data = json.load(f)
+
+    frame_size = calculate_frame_size(setting_data)
+    radar.set_fifo_parameters(frame_size, 4096, 2048)
+    radar.start()
+    print("Radar started!")
+
+    num_samples = int(setting_data.get("num_samples_per_chirp", 64))
+    num_chirps  = int(setting_data.get("num_chirps_per_frame",  16))
+    range_res   = MAX_RANGE_M / (num_samples // 2 + 1)
+
+except Exception as e:
+    print(f"Radar init failed: {e} — running in demo mode")
+    radar        = None
+    setting_data = {"num_rx_antennas": 3, "num_chirps_per_frame": 16, "num_samples_per_chirp": 64}
+    num_samples  = 64
+    num_chirps   = 16
+    range_res    = MAX_RANGE_M / (num_samples // 2 + 1)
+
+# ─────────────────────────────────────────────
+#  RANGE PROFILE
+# ─────────────────────────────────────────────
+RP_W = SIDEBAR_W - 48
+RP_H = 64
+rp_surf   = pygame.Surface((RP_W, RP_H))
+rp_latest = np.zeros(num_samples // 2 + 1)
+
+def update_range_profile(magnitude):
+    global rp_latest
+    rp_latest = magnitude.max(axis=0)
+
+def draw_range_profile(surf, x, y):
+    rp_surf.fill(PANEL_BG2)
+
+    for m in range(1, 6):
+        gx = int((m / MAX_RANGE_M) * RP_W)
+        pygame.draw.line(rp_surf, GRID_LINE, (gx, 0), (gx, RP_H - 14), 1)
+
+    bins = len(rp_latest)
+    pts  = []
+    peak = max(rp_latest.max(), 1.0)
+    for b in range(bins):
+        px_ = int(b / bins * RP_W)
+        amp = rp_latest[b] / peak
+        py_ = int((RP_H - 16) - amp * (RP_H - 22))
+        pts.append((px_, py_))
+
+    if len(pts) >= 2:
+        fill_pts = [(0, RP_H - 14)] + pts + [(RP_W - 1, RP_H - 14)]
+        fill_s   = pygame.Surface((RP_W, RP_H), pygame.SRCALPHA)
+        pygame.draw.polygon(fill_s, (*ACCENT, 30), fill_pts)
+        rp_surf.blit(fill_s, (0, 0))
+        pygame.draw.lines(rp_surf, ACCENT_GLOW, False, pts, 2)
+
+    for t in targets.values():
+        if t.stale():
+            continue
+        bx = int((t.dist_m / MAX_RANGE_M) * RP_W)
+        pygame.draw.line(rp_surf, WARNING, (bx, 0), (bx, RP_H - 14), 1)
+        lbl = font_tiny.render(f"T{t.id}", True, WARNING)
+        rp_surf.blit(lbl, (min(bx + 3, RP_W - lbl.get_width() - 2), 2))
+
+    for m in range(0, 6):
+        gx = int((m / MAX_RANGE_M) * RP_W)
+        lbl = font_tiny.render(f"{m}m", True, TEXT_TERT)
+        lx = min(max(gx - lbl.get_width() // 2, 0), RP_W - lbl.get_width())
+        rp_surf.blit(lbl, (lx, RP_H - 12))
+
+    surf.blit(rp_surf, (x, y))
+    rounded_rect(surf, (x, y, RP_W, RP_H), BORDER, radius=8, width=1)
+
+# ─────────────────────────────────────────────
+#  TOPBAR
+# ─────────────────────────────────────────────
+def draw_topbar(now, cam_alive):
+    pygame.draw.rect(screen, PANEL_BG, (0, 0, WIN_W, TOPBAR_H))
+    pygame.draw.line(screen, BORDER, (0, TOPBAR_H), (WIN_W, TOPBAR_H), 1)
+
+    mark_cx, mark_cy = 28, TOPBAR_H // 2
+    pygame.gfxdraw.aacircle(screen, mark_cx, mark_cy, 9, ACCENT)
+    pygame.gfxdraw.aacircle(screen, mark_cx, mark_cy, 6, ACCENT)
+    fill_aa_circle(screen, ACCENT, mark_cx, mark_cy, 2)
+
+    brand = font_brand.render("CAMERA + BGT60TR13C FUSION", True, TEXT_PRI)
+    screen.blit(brand, (48, (TOPBAR_H - brand.get_height()) // 2 - 6))
+
+    sub = font_small.render("YOLOv8n  ·  60.5 GHz FMCW  ·  3 RX", True, TEXT_SEC)
+    screen.blit(sub, (48, (TOPBAR_H - brand.get_height()) // 2 + brand.get_height() - 5))
+
+    # Radar status pill (static, no pulse animation)
+    pill_text = "RADAR LIVE" if radar is not None else "RADAR DEMO"
+    pill_col  = SUCCESS if radar is not None else WARNING
+    pill_txt  = font_pill.render(pill_text, True, pill_col)
+    pr_w = pill_txt.get_width() + 30
+    pr_h = 26
+    pr_x = 340
+    pr_y = (TOPBAR_H - pr_h) // 2
+    rounded_rect(screen, (pr_x, pr_y, pr_w, pr_h), (*pill_col, 18), radius=13)
+    rounded_rect(screen, (pr_x, pr_y, pr_w, pr_h), (*pill_col, 80), radius=13, width=1)
+    dot_alpha = 220
+    pygame.gfxdraw.filled_circle(screen, pr_x + 14, pr_y + pr_h // 2, 4, (*pill_col, dot_alpha))
+    screen.blit(pill_txt, (pr_x + 24, pr_y + (pr_h - pill_txt.get_height()) // 2))
+
+    # Camera status pill
+    cam_text = "CAM LIVE" if cam_alive else "CAM NO SIGNAL"
+    cam_col  = SUCCESS if cam_alive else DANGER
+    cam_txt  = font_pill.render(cam_text, True, cam_col)
+    cw = cam_txt.get_width() + 30
+    cx_ = pr_x + pr_w + 12
+    rounded_rect(screen, (cx_, pr_y, cw, pr_h), (*cam_col, 18), radius=13)
+    rounded_rect(screen, (cx_, pr_y, cw, pr_h), (*cam_col, 80), radius=13, width=1)
+    pygame.gfxdraw.filled_circle(screen, cx_ + 14, pr_y + pr_h // 2, 4, (*cam_col, dot_alpha))
+    screen.blit(cam_txt, (cx_ + 24, pr_y + (pr_h - cam_txt.get_height()) // 2))
+
+    ts  = time.strftime("%H:%M:%S")
+    date_str = time.strftime("%d %b %Y")
+    ts_txt   = font_body_b.render(ts, True, TEXT_PRI)
+    date_txt = font_tiny.render(date_str, True, TEXT_SEC)
+    screen.blit(ts_txt,   (WIN_W - ts_txt.get_width() - 24, TOPBAR_H // 2 - ts_txt.get_height() - 1))
+    screen.blit(date_txt, (WIN_W - date_txt.get_width() - 24, TOPBAR_H // 2 + 2))
+
+    frm_txt = font_mono_sm.render(f"FRAME {frame_no:06d}", True, TEXT_TERT)
+    screen.blit(frm_txt, (WIN_W - SIDEBAR_W - frm_txt.get_width() - 24,
+                           (TOPBAR_H - frm_txt.get_height()) // 2))
+
+# ─────────────────────────────────────────────
+#  CAMERA PANEL
+# ─────────────────────────────────────────────
+def draw_camera_panel(dets, radar_snapshot):
+    """Draws the camera feed with YOLO boxes + projected radar lines."""
+    pygame.draw.rect(screen, PANEL_BG, (CAM_X, CAM_Y, CAMERA_PANEL_W, CAM_PANEL_H))
+
+    with lock:
+        frame = latest_frame.copy() if latest_frame is not None else None
+
+    header = font_h.render("CAMERA + YOLO", True, TEXT_SEC)
+    screen.blit(header, (CAM_X + 18, CAM_Y + 12))
+
+    inner_y = CAM_Y + 36
+    inner_h = CAM_PANEL_H - 46
+    inner_w = CAMERA_PANEL_W - 36
+
+    if frame is None:
+        rounded_rect(screen, (CAM_X + 18, inner_y, inner_w, inner_h), PANEL_BG2, radius=12)
+        rounded_rect(screen, (CAM_X + 18, inner_y, inner_w, inner_h), BORDER, radius=12, width=1)
+        msg = font_body.render("Waiting for camera feed…", True, TEXT_SEC)
+        screen.blit(msg, (CAM_X + 18 + inner_w // 2 - msg.get_width() // 2,
+                           inner_y + inner_h // 2 - msg.get_height() // 2))
+        return False
+
+    annotated = frame.copy()
+
+    # --- YOLO boxes ---
+    for d in dets:
+        color = (0, 255, 0)
+        if d["cam_dist"] is not None:
+            if d["cam_dist"] < 1:
+                color = (0, 0, 255)
+            elif d["cam_dist"] < 2:
+                color = (0, 165, 255)
+        text = d["label"]
+        if d["cam_dist"] is not None:
+            text += f' {d["cam_dist"]:.2f}m'
+        cv2.rectangle(annotated, (d["x1"], d["y1"]), (d["x2"], d["y2"]), color, 2)
+        cv2.putText(annotated, text, (d["x1"], d["y1"] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    # --- Radar fusion lines projected onto camera pixel space ---
+    for i, t in enumerate(radar_snapshot):
+        px = angle_to_cam_pixel_x(t.angle_deg)
+        confirmed = any(d["x1"] <= px <= d["x2"] for d in dets)
+        color = (0, 255, 255) if confirmed else (220, 90, 232)  # BGR-ish yellow / magenta
+        label = "RADAR+CAM" if confirmed else "RADAR-ONLY"
+        cv2.line(annotated, (px, 0), (px, CAM_H), color, 1)
+        cv2.putText(annotated, f'{label} {t.dist_m:.2f}m',
+                    (min(px + 5, CAM_W - 160), 20 + 20 * i),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+
+    # Convert BGR (OpenCV) -> RGB, transpose for pygame, scale into panel
+    rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+    rgb = np.transpose(rgb, (1, 0, 2))
+    cam_surface = pygame.surfarray.make_surface(rgb)
+    cam_surface = pygame.transform.smoothscale(cam_surface, (inner_w, inner_h))
+
+    screen.blit(cam_surface, (CAM_X + 18, inner_y))
+    rounded_rect(screen, (CAM_X + 18, inner_y, inner_w, inner_h), BORDER, radius=12, width=1)
+    return True
+
+# ─────────────────────────────────────────────
+#  SIDEBAR
+# ─────────────────────────────────────────────
+SB_X = WIN_W - SIDEBAR_W
+PAD  = 18
+
+def section_header(text, x, y):
+    spaced = pygame.Surface((300, 16), pygame.SRCALPHA)
+    cx = 0
+    for ch in text.upper():
+        c_img = font_h.render(ch, True, TEXT_SEC)
+        spaced.blit(c_img, (cx, 0))
+        cx += c_img.get_width() + 2
+    screen.blit(spaced, (x, y))
+
+def draw_target_card(t, x, y, w):
+    h = 116
+    zone = range_zone(t.dist_m)
+    zcol = zone_color(zone)
+    xm = t.dist_m * math.sin(math.radians(t.angle_deg))
+    ym = t.dist_m * math.cos(math.radians(t.angle_deg))
+
+    rounded_rect(screen, (x, y, w, h), PANEL_BG2, radius=12)
+    rounded_rect(screen, (x, y, w, h), BORDER, radius=12, width=1)
+
+    fill_aa_circle(screen, zcol, x + 18, y + 20, 4)
+    id_txt = font_body_b.render(f"Target {t.id:02d}", True, TEXT_PRI)
+    screen.blit(id_txt, (x + 28, y + 13))
+
+    badge_txt = font_tiny.render(zone, True, zcol)
+    bw = badge_txt.get_width() + 16
+    bh = badge_txt.get_height() + 6
+    bx = x + w - bw - 14
+    by = y + 12
+    rounded_rect(screen, (bx, by, bw, bh), (*zcol, 22), radius=bh // 2)
+    rounded_rect(screen, (bx, by, bw, bh), (*zcol, 90), radius=bh // 2, width=1)
+    screen.blit(badge_txt, (bx + 8, by + 3))
+
+    pygame.draw.line(screen, BORDER_SOFT, (x + 16, y + 42), (x + w - 16, y + 42), 1)
+
+    col_w = (w - 32) // 2
+    metrics = [
+        ("RANGE",    f"{t.dist_m:.2f} m",   TEXT_PRI,    font_metric),
+        ("AZIMUTH",  f"{t.angle_deg:+.1f}°", ACCENT_GLOW, font_metric),
+        ("X OFFSET", f"{xm:+.2f} m",         TEXT_SEC,    font_metric_s),
+        ("Y DEPTH",  f"{ym:.2f} m",          TEXT_SEC,    font_metric_s),
+    ]
+    for i, (lbl, val, vcol, vfont) in enumerate(metrics):
+        col_i, row_i = i % 2, i // 2
+        mx = x + 16 + col_i * col_w
+        my = y + 50 + row_i * 32
+        lbl_img = font_tiny.render(lbl, True, TEXT_TERT)
+        val_img = vfont.render(val, True, vcol)
+        screen.blit(lbl_img, (mx, my))
+        screen.blit(val_img, (mx, my + 13))
+
+    bar_y = y + h - 16
+    sig_col = signal_color(t.energy)
+    lbl_img = font_tiny.render("SIGNAL", True, TEXT_TERT)
+    pct_img = font_tiny.render(f"{int(t.energy * 100)}%", True, sig_col)
+    screen.blit(lbl_img, (x + 16, bar_y - 13))
+    screen.blit(pct_img, (x + w - 16 - pct_img.get_width(), bar_y - 13))
+
+    bar_x, bar_w, bar_h = x + 16, w - 32, 5
+    rounded_rect(screen, (bar_x, bar_y, bar_w, bar_h), BORDER_SOFT, radius=3)
+    fill_w = max(4, int(bar_w * t.energy))
+    rounded_rect(screen, (bar_x, bar_y, fill_w, bar_h), sig_col, radius=3)
+
+    return h
+
+def draw_sidebar(now):
+    pygame.draw.rect(screen, PANEL_BG, (SB_X, TOPBAR_H, SIDEBAR_W, WIN_H - TOPBAR_H - BOTTOMBAR_H))
+    pygame.draw.line(screen, BORDER, (SB_X, TOPBAR_H), (SB_X, WIN_H - BOTTOMBAR_H), 1)
+
+    active = {tid: t for tid, t in targets.items() if not t.stale()}
+
+    sy = TOPBAR_H + PAD
+    section_header("Detected targets", SB_X + PAD, sy)
+    count_txt = font_small.render(f"{len(active)} / {MAX_TARGETS}", True, TEXT_TERT)
+    screen.blit(count_txt, (SB_X + SIDEBAR_W - PAD - count_txt.get_width(), sy - 1))
+    sy += 26
+
+    if not active:
+        empty_h = 96
+        rounded_rect(screen, (SB_X + PAD, sy, SIDEBAR_W - 2 * PAD, empty_h), PANEL_BG2, radius=12)
+        rounded_rect(screen, (SB_X + PAD, sy, SIDEBAR_W - 2 * PAD, empty_h), BORDER, radius=12, width=1)
+        msg = font_body.render("No targets in range", True, TEXT_SEC)
+        sub = font_tiny.render(f"Scanning within {PRIORITY_RANGE_M:.0f} m priority zone", True, TEXT_TERT)
+        screen.blit(msg, (SB_X + SIDEBAR_W // 2 - msg.get_width() // 2, sy + 32))
+        screen.blit(sub, (SB_X + SIDEBAR_W // 2 - sub.get_width() // 2, sy + 54))
+        sy += empty_h + 18
+    else:
+        for tid, t in sorted(active.items()):
+            h = draw_target_card(t, SB_X + PAD, sy, SIDEBAR_W - 2 * PAD)
+            sy += h + 12
+
+    section_header("Range profile", SB_X + PAD, sy)
+    sy += 24
+    draw_range_profile(screen, SB_X + PAD, sy)
+    sy += RP_H + 16
+
+    section_header("System", SB_X + PAD, sy)
+    sy += 24
+    info_rows = [
+        ("Sensor",     "BGT60TR13C"),
+        ("Max range",  f"{MAX_RANGE_M:.1f} m"),
+        ("Priority",   f"≤ {PRIORITY_RANGE_M:.1f} m"),
+        ("Channels",   f"{int(setting_data.get('num_rx_antennas', 3))} RX"),
+    ]
+    for lbl, val in info_rows:
+        l_img = font_small.render(lbl, True, TEXT_SEC)
+        v_img = font_small.render(val, True, TEXT_PRI)
+        screen.blit(l_img, (SB_X + PAD, sy))
+        screen.blit(v_img, (SB_X + SIDEBAR_W - PAD - v_img.get_width(), sy))
+        sy += 22
+
+# ─────────────────────────────────────────────
+#  BOTTOMBAR
+# ─────────────────────────────────────────────
+def draw_bottombar(now):
+    by = WIN_H - BOTTOMBAR_H
+    pygame.draw.rect(screen, PANEL_BG, (0, by, WIN_W, BOTTOMBAR_H))
+    pygame.draw.line(screen, BORDER, (0, by), (WIN_W, by), 1)
+
+    active_n = sum(1 for t in targets.values() if not t.stale())
+    status   = "Tracking" if active_n else "Scanning"
+    scol     = SUCCESS if active_n else ACCENT
+
+    cells = [
+        ("STATUS",     status,                       scol),
+        ("CONTACTS",   f"{active_n}",                TEXT_PRI),
+        ("YOLO FPS",   f"{yolo_fps:.1f} fps",         TEXT_PRI),
+        ("RADAR FPS",  f"{radar_fps:.1f} fps",        TEXT_PRI),
+    ]
+    cell_w = WIN_W // len(cells)
+    for i, (lbl, val, vcol) in enumerate(cells):
+        cx_ = i * cell_w
+        if i > 0:
+            pygame.draw.line(screen, BORDER, (cx_, by + 14), (cx_, WIN_H - 14), 1)
+
+        if lbl == "STATUS":
+            fill_aa_circle(screen, scol, cx_ + 24, by + BOTTOMBAR_H // 2, 4)
+            l_img = font_tiny.render(lbl, True, TEXT_TERT)
+            v_img = font_bottom_v.render(val, True, vcol)
+            screen.blit(l_img, (cx_ + 36, by + 14))
+            screen.blit(v_img, (cx_ + 36, by + 28))
+        else:
+            l_img = font_tiny.render(lbl, True, TEXT_TERT)
+            v_img = font_bottom_v.render(val, True, vcol)
+            screen.blit(l_img, (cx_ + 24, by + 14))
+            screen.blit(v_img, (cx_ + 24, by + 28))
+
+# ─────────────────────────────────────────────
+#  RADAR SCOPE DRAW
+# ─────────────────────────────────────────────
+sweep_deg = 0.0
+
+def draw_radar_dynamic(now):
+    global sweep_deg
+    sweep_deg = (sweep_deg + 1.65) % 360
+
+    pygame.draw.rect(screen, BG, (CAMERA_PANEL_W, TOPBAR_H, RADAR_AREA_W, WIN_H - TOPBAR_H - BOTTOMBAR_H))
+    screen.blit(static_radar, (0, 0))
+
+    sweep_rad = math.radians(sweep_deg - 90)
+
+    # Single clean sweep line, no fading multi-line trail
+    sweep_surf = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+    pygame.draw.line(sweep_surf, (*ACCENT_GLOW, 200),
+                     (RCX, RCY),
+                     (int(RCX + RAD * math.cos(sweep_rad)),
+                      int(RCY + RAD * math.sin(sweep_rad))), 2)
+    screen.blit(sweep_surf, (0, 0))
+
+    active = {tid: t for tid, t in targets.items() if not t.stale()}
+
+    for tid, t in active.items():
+        for i in range(1, len(t.trail)):
+            col = GRID_LINE
+            pygame.draw.line(screen, col, t.trail[i - 1], t.trail[i], 1)
+
+        lr = 14  # fixed lock ring size, no pulsing animation
+
+        pygame.gfxdraw.aacircle(screen, t.px, t.py, lr, (*ACCENT_GLOW, 255))
+
+        bsz = 8
+        for sx, sy_ in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
+            bx_ = t.px + sx * (lr + 5)
+            by_ = t.py + sy_ * (lr + 5)
+            pygame.draw.line(screen, ACCENT_GLOW, (bx_ + sx * bsz, by_), (bx_, by_), 2)
+            pygame.draw.line(screen, ACCENT_GLOW, (bx_, by_ + sy_ * bsz), (bx_, by_), 2)
+
+        zcol = zone_color(range_zone(t.dist_m))
+        fill_aa_circle(screen, zcol, t.px, t.py, 4)
+        pygame.gfxdraw.aacircle(screen, t.px, t.py, 5, (*TEXT_PRI, 180))
+
+        tag_w, tag_h = 100, 50
+        if t.px > RCX:
+            tx = t.px - lr - tag_w - 8
+        else:
+            tx = t.px + lr + 8
+        ty = max(TOPBAR_H + 6, min(t.py - tag_h // 2, WIN_H - BOTTOMBAR_H - tag_h - 6))
+
+        tag_s = pygame.Surface((tag_w, tag_h), pygame.SRCALPHA)
+        pygame.draw.rect(tag_s, (*PANEL_BG2, 235), (0, 0, tag_w, tag_h), border_radius=10)
+        pygame.draw.rect(tag_s, (*BORDER, 255), (0, 0, tag_w, tag_h), 1, border_radius=10)
+        screen.blit(tag_s, (tx, ty))
+
+        screen.blit(font_mono_tag.render(f"T{t.id:02d}", True, ACCENT_GLOW), (tx + 10, ty + 8))
+        screen.blit(font_mono_sm.render(f"{t.dist_m:.2f} m", True, TEXT_PRI),  (tx + 10, ty + 25))
+        screen.blit(font_mono_sm.render(f"{t.angle_deg:+.1f}°", True, TEXT_SEC), (tx + 10, ty + 38))
+
+        leader_s = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        lx = t.px + (lr + 3) * (1 if t.px <= RCX else -1)
+        lend = tx + tag_w if t.px > RCX else tx
+        pygame.draw.line(leader_s, (*BORDER, 200), (lx, t.py), (lend, ty + tag_h // 2), 1)
+        screen.blit(leader_s, (0, 0))
+
+    pygame.draw.line(screen, (*TEXT_TERT, 160), (RCX - 12, RCY), (RCX + 12, RCY), 1)
+    pygame.draw.line(screen, (*TEXT_TERT, 160), (RCX, RCY - 12), (RCX, RCY + 12), 1)
+    pygame.gfxdraw.aacircle(screen, RCX, RCY, 4, (*TEXT_TERT, 180))
+
+# ─────────────────────────────────────────────
+#  START BACKGROUND THREADS
+# ─────────────────────────────────────────────
+threading.Thread(target=capture_thread, daemon=True).start()
+threading.Thread(target=inference_thread, daemon=True).start()
+
+# ─────────────────────────────────────────────
+#  MAIN LOOP
+# ─────────────────────────────────────────────
+pg_running = True
+_last_radar_t = time.time()
+
+while pg_running:
+    clock.tick(FPS)
+    now = time.time()
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            pg_running = False
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            pg_running = False
+
+    # ── Read radar frame ─────────────────────
+    if radar is not None and not radar.frame_buffer.empty():
+        frame = radar.frame_buffer.get()
+        raw   = np.frombuffer(frame, dtype=np.uint16)
+        frame_no += 1
+        objects_raw = []
+
+        _now_radar = time.time()
+        _dt_radar = _now_radar - _last_radar_t
+        if _dt_radar > 0:
+            radar_fps = 1.0 / _dt_radar
+        _last_radar_t = _now_radar
+
+        try:
+            magnitude = process_radar_cube(raw, setting_data)
+            magnitude[:, :5] = 0
+            update_range_profile(magnitude)
+
+            threshold  = np.max(magnitude) * 0.45
+            sorted_idx = np.argsort(magnitude.flatten())[::-1]
+            count      = 0
+
+            for idx in sorted_idx:
+                if count >= MAX_TARGETS:
+                    break
+                ci, ri = np.unravel_index(idx, magnitude.shape)
+                if magnitude[ci, ri] < threshold:
+                    break
+                dist_m = ri * range_res
+                if dist_m < 0.3 or dist_m > PRIORITY_RANGE_M:
+                    continue
+                angle_deg = (ci - num_chirps / 2) * (RADAR_FOV_DEG / num_chirps)
+                rad_a     = math.radians(angle_deg)
+                px_ = int(RCX + dist_m * (RAD / MAX_RANGE_M) * math.sin(rad_a))
+                py_ = int(RCY - dist_m * (RAD / MAX_RANGE_M) * math.cos(rad_a))
+
+                if any(abs(px_ - ox) < 22 and abs(py_ - oy) < 22 for ox, oy, *_ in objects_raw):
+                    continue
+
+                energy_norm = min(1.0, magnitude[ci, ri] / (np.max(magnitude) + 1e-9))
+                objects_raw.append((px_, py_, dist_m, angle_deg, energy_norm))
+                count += 1
+
+        except Exception as e:
+            print("Processing error:", e)
+
+        matched     = set()
+        new_targets = {}
+        for (px_, py_, dm, ad, en) in objects_raw:
+            best_id, best_d = None, 45
+            for tid, t in targets.items():
+                if tid in matched:
+                    continue
+                d = math.hypot(px_ - t.px, py_ - t.py)
+                if d < best_d:
+                    best_d, best_id = d, tid
+            if best_id is not None:
+                targets[best_id].update(px_, py_, dm, ad, en)
+                new_targets[best_id] = targets[best_id]
+                matched.add(best_id)
+            else:
+                nt = Target(px_, py_, dm, ad, en)
+                new_targets[nt.id] = nt
+        for tid, t in targets.items():
+            if tid not in new_targets and not t.stale():
+                new_targets[tid] = t
+        targets = new_targets
+
+    # ── Snapshot YOLO detections + active radar targets for fusion drawing ──
+    with lock:
+        dets_snapshot = list(yolo_detections)
+    active_targets = [t for t in targets.values() if not t.stale()]
+
+    # ── Render ───────────────────────────────
+    screen.fill(BG)
+
+    cam_alive = draw_camera_panel(dets_snapshot, active_targets)
+    draw_radar_dynamic(now)
+    draw_sidebar(now)
+    draw_topbar(now, cam_alive)
+    draw_bottombar(now)
+
+    pygame.display.flip()
+
+# ── Cleanup ──────────────────────────────────
+running = False
+if radar is not None:
+    try:
+        radar.stop()
+    except Exception:
+        pass
+cam_proc.terminate()
+pygame.quit()
