@@ -1,0 +1,458 @@
+#include <WiFiS3.h>
+#include <Servo.h>
+
+const char* AP_SSID = "UGV-Control";
+const char* AP_PASS = "harsh1234";
+
+const int ESC_PIN   = 9;
+const int SERVO_PIN = 10;
+
+const int ESC_STOP    = 1500;
+const int STEER_CENTRE = 1500;
+const int STEER_LEFT   = 1800;
+const int STEER_RIGHT  = 1200;
+
+// 4 speed levels — SLOW / MEDIUM / HIGH / ULTRA
+const int FWD_SPEEDS[] = { 1650, 1720, 1820, 2000 };
+const int REV_SPEEDS[] = { 1350, 1280, 1180, 1000 };
+
+Servo esc;
+Servo steer;
+WiFiServer server(80);
+
+String driveState = "STOP";
+String steerState = "CENTRE";
+int    speedLevel = 0;   // 0=SLOW 1=MEDIUM 2=HIGH 3=ULTRA
+
+const char* SPEED_NAMES[] = { "SLOW", "MEDIUM", "HIGH", "ULTRA" };
+
+const char HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no">
+<title>UGV Control</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+body{
+  background:#07090f;
+  font-family:'Courier New',monospace;
+  color:#c8d8e8;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  min-height:100vh;
+  padding:14px;
+  gap:12px;
+}
+
+/* header */
+.header{text-align:center;}
+.header h1{color:#1d9e75;font-size:20px;letter-spacing:4px;}
+.header p{color:#2a4050;font-size:10px;letter-spacing:2px;margin-top:3px;}
+
+/* status bar */
+.statusbar{
+  width:100%;max-width:460px;
+  background:#0e1318;
+  border:1px solid #1a2a3a;
+  border-radius:8px;
+  padding:8px 14px;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  font-size:12px;
+}
+.s-item{display:flex;flex-direction:column;align-items:center;gap:2px;}
+.s-lbl{color:#2a4050;font-size:9px;letter-spacing:1px;}
+.s-val{color:#1d9e75;font-weight:bold;font-size:13px;}
+.s-val.danger{color:#e05252;}
+.s-val.warn{color:#f5a623;}
+
+/* speed selector */
+.speed-panel{
+  width:100%;max-width:460px;
+  background:#0e1318;
+  border:1px solid #1a2a3a;
+  border-radius:8px;
+  padding:10px 14px;
+}
+.speed-title{font-size:9px;color:#2a4050;letter-spacing:1px;margin-bottom:8px;}
+.speed-btns{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;}
+.spd{
+  padding:10px 4px;
+  border-radius:7px;
+  border:1.5px solid #1a2a3a;
+  background:#0a1018;
+  color:#4a6070;
+  font-family:'Courier New',monospace;
+  font-size:11px;
+  font-weight:bold;
+  letter-spacing:1px;
+  cursor:pointer;
+  text-align:center;
+  transition:all 0.12s;
+}
+.spd:active{transform:scale(0.94);}
+.spd.active-slow  {background:#0a2a0a;border-color:#1d9e75;color:#1d9e75;}
+.spd.active-medium{background:#1a1a0a;border-color:#c8b400;color:#c8b400;}
+.spd.active-high  {background:#1a0f0a;border-color:#f5a623;color:#f5a623;}
+.spd.active-ultra {background:#1a0808;border-color:#e05252;color:#e05252;}
+
+/* control grid */
+.ctrl-wrap{width:100%;max-width:460px;}
+.ctrl-lbl{font-size:9px;color:#2a4050;letter-spacing:1px;margin-bottom:6px;}
+.grid{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  grid-template-rows:repeat(3,90px);
+  gap:7px;
+}
+.btn{
+  background:#0a1018;
+  border:1.5px solid #1a2a3a;
+  border-radius:10px;
+  color:#c8d8e8;
+  font-family:'Courier New',monospace;
+  font-size:10px;
+  font-weight:bold;
+  letter-spacing:0.5px;
+  cursor:pointer;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  gap:5px;
+  user-select:none;
+  -webkit-user-select:none;
+  transition:transform 0.07s,background 0.07s,border-color 0.07s;
+  touch-action:none;
+}
+.btn .ic{font-size:28px;line-height:1;}
+.btn:active{transform:scale(0.90);}
+
+/* colour per action */
+.btn.fwd  {border-color:#1d9e75;}
+.btn.fwd.held  {background:#0a2a18;color:#1d9e75;}
+.btn.rev  {border-color:#c8a800;}
+.btn.rev.held  {background:#1a1800;color:#c8b400;}
+.btn.lft  {border-color:#3a9ad9;}
+.btn.lft.held  {background:#0a1828;color:#3a9ad9;}
+.btn.rgt  {border-color:#3a9ad9;}
+.btn.rgt.held  {background:#0a1828;color:#3a9ad9;}
+.btn.fwdl {border-color:#1dc8a0;}
+.btn.fwdl.held {background:#0a2020;color:#1dc8a0;}
+.btn.fwdr {border-color:#1dc8a0;}
+.btn.fwdr.held {background:#0a2020;color:#1dc8a0;}
+.btn.stop {background:#1a0808;border-color:#e05252;color:#e05252;}
+.btn.stop:active{background:#e05252;color:#fff;}
+.empty{visibility:hidden;}
+
+/* keyboard hint */
+.hints{
+  width:100%;max-width:460px;
+  background:#0a1018;
+  border:1px solid #1a2a3a;
+  border-radius:7px;
+  padding:8px 12px;
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:4px 16px;
+  font-size:10px;
+  color:#2a4050;
+}
+.hints b{color:#3a6050;}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>UGV CONTROL</h1>
+  <p>MAVERICK SCOUT 4WD -- ARDUINO R4 WIFI</p>
+</div>
+
+<div class="statusbar">
+  <div class="s-item">
+    <span class="s-lbl">DRIVE</span>
+    <span class="s-val" id="sDrive">STOP</span>
+  </div>
+  <div class="s-item">
+    <span class="s-lbl">STEER</span>
+    <span class="s-val" id="sSteer">CENTRE</span>
+  </div>
+  <div class="s-item">
+    <span class="s-lbl">SPEED</span>
+    <span class="s-val" id="sSpeed">SLOW</span>
+  </div>
+  <div class="s-item">
+    <span class="s-lbl">PWM</span>
+    <span class="s-val" id="sPwm">1500</span>
+  </div>
+</div>
+
+<div class="speed-panel">
+  <div class="speed-title">SPEED LEVEL -- TAP TO SELECT</div>
+  <div class="speed-btns">
+    <button class="spd active-slow" id="sp0" onclick="setSpd(0)">SLOW</button>
+    <button class="spd" id="sp1" onclick="setSpd(1)">MEDIUM</button>
+    <button class="spd" id="sp2" onclick="setSpd(2)">HIGH</button>
+    <button class="spd" id="sp3" onclick="setSpd(3)">ULTRA</button>
+  </div>
+</div>
+
+<div class="ctrl-wrap">
+  <div class="ctrl-lbl">CONTROLS -- HOLD TO MOVE, RELEASE TO STOP</div>
+  <div class="grid">
+
+    <!-- Row 1 -->
+    <button class="btn fwdl" id="bFL"
+      ontouchstart="hold('FL')" ontouchend="release('FL')"
+      onmousedown="hold('FL')" onmouseup="release('FL')" onmouseleave="release('FL')">
+      <span class="ic">&#8598;</span>FWD+L
+    </button>
+
+    <button class="btn fwd" id="bF"
+      ontouchstart="hold('F')" ontouchend="release('F')"
+      onmousedown="hold('F')" onmouseup="release('F')" onmouseleave="release('F')">
+      <span class="ic">&#9650;</span>FORWARD
+    </button>
+
+    <button class="btn fwdr" id="bFR"
+      ontouchstart="hold('FR')" ontouchend="release('FR')"
+      onmousedown="hold('FR')" onmouseup="release('FR')" onmouseleave="release('FR')">
+      <span class="ic">&#8599;</span>FWD+R
+    </button>
+
+    <!-- Row 2 -->
+    <button class="btn lft" id="bL"
+      ontouchstart="hold('L')" ontouchend="release('L')"
+      onmousedown="hold('L')" onmouseup="release('L')" onmouseleave="release('L')">
+      <span class="ic">&#9664;</span>LEFT
+    </button>
+
+    <button class="btn stop" id="bS"
+      ontouchstart="cmd('S')" onmousedown="cmd('S')">
+      <span class="ic">&#9632;</span>STOP
+    </button>
+
+    <button class="btn rgt" id="bR"
+      ontouchstart="hold('R')" ontouchend="release('R')"
+      onmousedown="hold('R')" onmouseup="release('R')" onmouseleave="release('R')">
+      <span class="ic">&#9654;</span>RIGHT
+    </button>
+
+    <!-- Row 3 -->
+    <div class="empty"></div>
+
+    <button class="btn rev" id="bB"
+      ontouchstart="hold('B')" ontouchend="release('B')"
+      onmousedown="hold('B')" onmouseup="release('B')" onmouseleave="release('B')">
+      <span class="ic">&#9660;</span>REVERSE
+    </button>
+
+    <div class="empty"></div>
+
+  </div>
+</div>
+
+<div class="hints">
+  <div><b>W</b> — Forward (hold)</div>
+  <div><b>X</b> — Reverse (hold)</div>
+  <div><b>A</b> — Left only (hold)</div>
+  <div><b>D</b> — Right only (hold)</div>
+  <div><b>Q</b> — Forward + Left</div>
+  <div><b>E</b> — Forward + Right</div>
+  <div><b>S</b> — STOP</div>
+  <div><b>1/2/3/4</b> — Speed level</div>
+</div>
+
+<script>
+var spd = 0;
+var activeCmd = null;
+var sending   = false;
+
+var SPEED_CLASSES = ['active-slow','active-medium','active-high','active-ultra'];
+
+function setSpd(level) {
+  spd = level;
+  for (var i = 0; i < 4; i++) {
+    var el = document.getElementById('sp' + i);
+    el.className = 'spd';
+    if (i === level) el.className = 'spd ' + SPEED_CLASSES[level];
+  }
+  cmd('SPD');
+}
+
+function hold(c) {
+  activeCmd = c;
+  document.getElementById('b' + (c==='F'?'F':c==='B'?'B':c==='L'?'L':c==='R'?'R':c==='FL'?'FL':'FR')).classList.add('held');
+  sendActive();
+}
+function release(c) {
+  activeCmd = null;
+  try { document.getElementById('b' + (c==='F'?'F':c==='B'?'B':c==='L'?'L':c==='R'?'R':c==='FL'?'FL':'FR')).classList.remove('held'); } catch(e){}
+  // on release: if it was throttle, stop drive; if steering only, centre
+  if (c === 'L' || c === 'R') {
+    cmd('C');
+  } else {
+    cmd('S');
+  }
+}
+
+function sendActive() {
+  if (!activeCmd) return;
+  cmd(activeCmd);
+  // keep sending while held for reliability
+  setTimeout(function(){ if (activeCmd) sendActive(); }, 150);
+}
+
+function cmd(c) {
+  if (sending) return;
+  sending = true;
+  fetch('/cmd?v=' + c + '&spd=' + spd)
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      document.getElementById('sDrive').innerText = j.drive;
+      document.getElementById('sSteer').innerText = j.steer;
+      document.getElementById('sSpeed').innerText = j.sname;
+      document.getElementById('sPwm').innerText   = j.pwm;
+      sending = false;
+    }).catch(function(){ sending = false; });
+}
+
+// keyboard
+var keyHeld = {};
+document.addEventListener('keydown', function(e) {
+  if (e.repeat) return;
+  var k = e.key.toLowerCase();
+  if (k==='w' && !keyHeld['w']) { keyHeld['w']=true; hold('F'); }
+  if (k==='x' && !keyHeld['x']) { keyHeld['x']=true; hold('B'); }
+  if (k==='a' && !keyHeld['a']) { keyHeld['a']=true; hold('L'); }
+  if (k==='d' && !keyHeld['d']) { keyHeld['d']=true; hold('R'); }
+  if (k==='q' && !keyHeld['q']) { keyHeld['q']=true; hold('FL'); }
+  if (k==='e' && !keyHeld['e']) { keyHeld['e']=true; hold('FR'); }
+  if (k==='s') cmd('S');
+  if (k==='1') setSpd(0);
+  if (k==='2') setSpd(1);
+  if (k==='3') setSpd(2);
+  if (k==='4') setSpd(3);
+});
+document.addEventListener('keyup', function(e) {
+  var k = e.key.toLowerCase();
+  if (k==='w') { keyHeld['w']=false; release('F'); }
+  if (k==='x') { keyHeld['x']=false; release('B'); }
+  if (k==='a') { keyHeld['a']=false; release('L'); }
+  if (k==='d') { keyHeld['d']=false; release('R'); }
+  if (k==='q') { keyHeld['q']=false; release('FL'); }
+  if (k==='e') { keyHeld['e']=false; release('FR'); }
+});
+
+// prevent context menu on long press mobile
+document.addEventListener('contextmenu', function(e){ e.preventDefault(); });
+</script>
+</body>
+</html>
+)rawhtml";
+
+void setup() {
+  Serial.begin(115200);
+
+  esc.attach(ESC_PIN,   1000, 2000);
+  steer.attach(SERVO_PIN, 1000, 2000);
+
+  Serial.println("ESC calibrating...");
+  esc.writeMicroseconds(2000);
+  delay(2000);
+  esc.writeMicroseconds(1000);
+  delay(2000);
+  esc.writeMicroseconds(ESC_STOP);
+  steer.writeMicroseconds(STEER_CENTRE);
+  delay(2000);
+  Serial.println("ESC ready");
+
+  WiFi.beginAP(AP_SSID, AP_PASS);
+  delay(1000);
+  server.begin();
+
+  Serial.println("Connect to: UGV-Control / harsh1234");
+  Serial.println("Open browser: http://192.168.4.1");
+}
+
+void loop() {
+  WiFiClient client = server.available();
+  if (!client) return;
+
+  String req = "";
+  while (client.connected()) {
+    if (client.available()) {
+      char c = client.read();
+      req += c;
+      if (req.endsWith("\r\n\r\n")) break;
+    }
+  }
+
+  if (req.indexOf("GET / ") >= 0) {
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: text/html");
+    client.println("Connection: close");
+    client.println();
+    for (int i = 0; i < (int)strlen_P(HTML); i++)
+      client.print((char)pgm_read_byte(HTML + i));
+    client.stop();
+    return;
+  }
+
+  if (req.indexOf("GET /cmd") >= 0) {
+
+    int vIdx = req.indexOf("v=");
+    String cmd = "";
+    if (vIdx >= 0) {
+      int endIdx = req.indexOf('&', vIdx);
+      if (endIdx < 0) endIdx = req.indexOf(' ', vIdx);
+      cmd = req.substring(vIdx + 2, endIdx);
+    }
+
+    int sIdx = req.indexOf("spd=");
+    int level = 0;
+    if (sIdx >= 0) {
+      level = constrain(req.charAt(sIdx + 4) - '0', 0, 3);
+    }
+
+    int escPwm   = ESC_STOP;
+    int steerPwm = STEER_CENTRE;
+    String drv   = "STOP";
+    String str   = "CENTRE";
+
+    if      (cmd == "F")   { escPwm=FWD_SPEEDS[level]; steerPwm=STEER_CENTRE; drv="FWD";  str="CENTRE"; }
+    else if (cmd == "B")   { escPwm=REV_SPEEDS[level]; steerPwm=STEER_CENTRE; drv="REV";  str="CENTRE"; }
+    else if (cmd == "FL")  { escPwm=FWD_SPEEDS[level]; steerPwm=STEER_LEFT;   drv="FWD";  str="LEFT";   }
+    else if (cmd == "FR")  { escPwm=FWD_SPEEDS[level]; steerPwm=STEER_RIGHT;  drv="FWD";  str="RIGHT";  }
+    else if (cmd == "L")   { escPwm=ESC_STOP;          steerPwm=STEER_LEFT;   drv="STOP"; str="LEFT";   }
+    else if (cmd == "R")   { escPwm=ESC_STOP;          steerPwm=STEER_RIGHT;  drv="STOP"; str="RIGHT";  }
+    else if (cmd == "C")   { escPwm=ESC_STOP;          steerPwm=STEER_CENTRE; drv="STOP"; str="CENTRE"; }
+    else if (cmd == "S")   { escPwm=ESC_STOP;          steerPwm=STEER_CENTRE; drv="STOP"; str="CENTRE"; }
+    else if (cmd == "SPD") { escPwm=ESC_STOP;          steerPwm=STEER_CENTRE; drv="STOP"; str="CENTRE"; }
+
+    esc.writeMicroseconds(escPwm);
+    steer.writeMicroseconds(steerPwm);
+
+    String json = "{\"drive\":\"" + drv +
+                  "\",\"steer\":\"" + str +
+                  "\",\"sname\":\"" + String(SPEED_NAMES[level]) +
+                  "\",\"pwm\":" + String(escPwm) + "}";
+
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: application/json");
+    client.println("Connection: close");
+    client.println();
+    client.println(json);
+    client.stop();
+    return;
+  }
+
+  client.println("HTTP/1.1 404 Not Found");
+  client.println("Connection: close");
+  client.println();
+  client.stop();
+}
